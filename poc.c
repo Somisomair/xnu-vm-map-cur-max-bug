@@ -29,11 +29,13 @@
  *      in vm_fault.c (6 sites) and vm_map.c (10+ sites)
  *
  * NOTES:
- *   - On SPTM devices (A15+, iOS 17+), pages typed as XNU_DEFAULT are
- *     vulnerable. SPTM-typed pages (pmap_ro_zone, PPL pages) have
- *     hardware-enforced protections that this bypass alone cannot defeat.
- *   - On PPL devices (A12-A14, iOS 14-16), kernel RO pages protected
- *     only by VM-layer max_protection are vulnerable.
+ *   - On SPTM devices (A15+, M2+), SPTM runs at GL2 and independently
+ *     validates PTE modifications by page type. Pages typed XNU_DEFAULT
+ *     (most kernel data) CAN be mapped writable — SPTM allows it.
+ *     Only XNU_PAGE_TABLE/XNU_EXEC/XNU_ROZONE are protected by type.
+ *     Verified: sptm.t8110.release.im4p present in A15 IPSW.
+ *   - On PPL devices (A12-A14, M1), PPL uses APRR at EL1 — no
+ *     independent hardware enforcement beyond the VM layer.
  *   - On Intel macOS (Monterey), kernel memory protections are purely
  *     VM-layer, so this bypass is directly effective.
  *   - This PoC is for RESEARCH AND EDUCATION ONLY.

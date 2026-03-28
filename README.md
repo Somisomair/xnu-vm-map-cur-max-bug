@@ -1,144 +1,67 @@
-# CVE-2024-27840 — Kernel Memory Protection Bypass
+# XNU vm_map cur>max Protection Bug
 
-Patched in iOS 17.5 / macOS 14.5 (May 13, 2024). Affects all Apple platforms.
+Found by patch-diffing XNU source between iOS 17.4 (xnu-10063.101.15) and iOS 17.5 (xnu-10063.121.3).
 
-## Summary
+We don't know which CVE it corresponds to. iOS 17.5 patched three kernel bugs (CVE-2024-27818, CVE-2024-27840, CVE-2024-27843). This could be any of them.
 
-| | |
-|---|---|
-| **CVE** | CVE-2024-27840 |
-| **Type** | Kernel memory protection bypass |
-| **Precondition** | Kernel code execution |
-| **Impact** | Create writable mappings to kernel read-only pages |
-| **Patched** | iOS 17.5 / macOS 14.5 |
-| **Affects** | iOS ≤17.4, macOS ≤14.4, tvOS ≤17.4, watchOS ≤10.4, visionOS ≤1.1 |
-| **Apple Description** | *"An attacker that has already achieved kernel code execution may be able to bypass kernel memory protections"* |
+## The Bug
 
-## Root Cause
+When you create a memory mapping with `mach_vm_map`, you pass two protection values:
+- `cur_protection` — what you can do with the memory right now
+- `max_protection` — the ceiling, what you should ever be able to do
 
-Two-stage bug in XNU.
+The kernel never checks that `cur` is actually within `max`. You can create a mapping with `cur=read+write` and `max=read-only`, and the kernel accepts it. The write works.
 
-### Stage 1 — Missing `cur ≤ max` validation
-
-`vm_map_enter_mem_object_helper()` in `osfmk/vm/vm_map.c` validates that `cur_protection` and `max_protection` have valid bits, but never checks that `cur_protection` is a subset of `max_protection`:
-
+Apple fixed this in iOS 17.5 by clamping `cur` to `max`:
 ```c
-// xnu-10063.101.15, vm_map.c:4172
-if ((target_map == VM_MAP_NULL) ||
-    (cur_protection & ~(VM_PROT_ALL | VM_PROT_ALLEXEC)) ||
-    (max_protection & ~(VM_PROT_ALL | VM_PROT_ALLEXEC)) ||
-    ...
-    initial_size == 0) {
-    return KERN_INVALID_ARGUMENT;
-}
-// NO CHECK: (cur_protection & max_protection) == cur_protection
-```
-
-A caller can create a mapping with `cur=RW, max=R` and the kernel accepts it.
-
-**Fix** (xnu-10063.121.3, line 4196):
-```c
-if (__improbable((cur_protection & max_protection) != cur_protection)) {
+if ((cur_protection & max_protection) != cur_protection) {
     cur_protection &= max_protection;
 }
 ```
 
-### Stage 2 — Dead asserts in RELEASE builds
+## What We Tested
 
-`vm_fault.c` contains `pmap_has_prot_policy()` checks that should enforce memory protection policies. But they were `assert()` calls:
+We built an iOS app that creates a mapping with `cur=RW, max=R` and tries to write through it.
 
-```c
-// Pre-fix: vm_fault.c
-if (!pmap_has_prot_policy(pmap, ..., *prot)) {
-    *prot &= ~VM_PROT_WRITE;
-} else {
-    assert(cs_bypass);  // ((void)0) in RELEASE builds
-}
-```
+| Test | What | Result |
+|---|---|---|
+| Sideloaded app (sandboxed) | mach_vm_map(cur=RW, max=R) | Write works, same physical page |
+| TrollStore app (unsandboxed) | Same test | Same result |
+| Coruna chain + SpringBoard injection | Same test inside SpringBoard | Same result |
+| mach_vm_protect(addr, RW) on same mapping | Try to upgrade via protect path | **Correctly blocked** |
 
-Apple ships RELEASE kernels where `MACH_ASSERT=0`. Every `assert()` expands to `((void)0)`. The protection policy check never executes on production devices.
+The protect path enforces max_protection. The mapping path doesn't. Same bug, two different code paths, one checks, one doesn't.
 
-**Fix**: 16 `assert()` calls converted to `if (...) panic(...)` which executes unconditionally.
+Device: iPhone 13 Pro Max, A15, iOS 17.0 (21A329).
 
-### How it chains together
+## What We Didn't Test
 
-```
-Kernel code execution
-  → vm_map_enter_mem_object(kernel_map, cur=RW, max=R)
-    → No cur⊆max validation → mapping created
-      → Page fault → pmap_has_prot_policy() returns TRUE
-        → assert(cs_bypass) → ((void)0) → skipped
-          → PTE created with write permission
-            → Kernel read-only page now writable
-```
+We only tested from userspace on our own process memory. We couldn't test from kernel context. We tried — the kernel exploit we had crashed the device, the kernel task port is blocked by multiple checks, and the exploit chain we used doesn't give persistent kernel access to injected code.
 
-From userspace, you can only target your own address space (not useful). The real impact requires kernel code execution to target `kernel_map`.
+The function with the bug (vm_map_enter_mem_object_helper) is the same for both user and kernel maps. The missing check applies to both. But we only proved it works on user maps.
 
-### SPTM note
+## Binary Verification
 
-On SPTM devices (A15+, iOS 17+), pages typed as `XNU_DEFAULT` (majority of kernel memory) are vulnerable. SPTM-typed pages have hardware-enforced protections that need additional bypasses.
+We checked the compiled kernelcache in Ghidra. There's a second part: vm_fault_enter_prepare had assert() calls that check protection policies. In release builds, assert() compiles to nothing. Apple fixed this by converting them to if/panic.
 
-## On-Device Test
+- iOS 17.0 kernelcache: zero panic strings for protection policy violations
+- iOS 17.5.1 kernelcache: four new panic strings
 
-Tested on iPhone 13 Pro Max (iPhone14,3), iOS 17.0 (21A329). Sideloaded via Xcode — fully sandboxed, no special entitlements. Also tested via TrollStore with identical results.
+The 17.0 kernel skips the protection check entirely. The 17.5.1 kernel panics if it fails.
 
-The userspace test maps the app's own memory with `cur>max` to confirm the kernel accepts it and creates a writable PTE. It does not touch kernel memory.
+## SPTM
 
-```
-mach_vm_map(task, &addr, 0x4000, 0, ANYWHERE,
-  port=0x610b, off=0, copy=NO,
-  cur=RW(0x3), max=R(0x1), NONE) = 0x0
-  -> addr = 0x100bdc000
-
-write *(char*)0x100bdc000 = 'B' ...
-  -> write OK (no fault)
-read *(char*)0x100bd8000 = 0x42 ('B')
-  -> original page changed: same physical page
-
-VULNERABLE — wrote through cur>max mapping
-
-mach_vm_protect(0x100bdc000, RW) = 0x2 ((os/kern) protection failure)
-```
-
-Key observations:
-- `mach_vm_map` accepts `cur > max` without returning an error
-- Write through the mapping succeeds — PTE was created with write permission
-- Original page modified — same physical page, not copy-on-write
-- `mach_vm_protect` to RW correctly fails — the protect path enforces `max_protection`, but the initial mapping path does not
-
-On patched systems (tested macOS 26.4): `mach_vm_map` returns success but `cur_protection` is silently clamped to `max_protection`. Write faults with SIGBUS.
+The test device (A15) has SPTM. The bug still works because SPTM enforces page types, not max_protection.
 
 ## Files
 
-| File | Description |
-|---|---|
-| `poc.c` | Full PoC — kernel-context exploit pseudocode + compilable userspace demo |
-| `ios_test_app.m` | iOS app source (UIKit) for on-device testing |
-| `Info.plist` | App bundle metadata |
-| `CVE27840App.ipa` | Pre-built .ipa (ldid signed, TrollStore compatible) |
+- `poc.c` — compilable userspace demo
+- `ios_test_app.m` — iOS app for on-device testing
+- `CVE27840Tweak.m` — arm64e dylib for Coruna/SpringBoard injection
+- `CVE27840App.ipa` — pre-built IPA (TrollStore)
 
-## Building the iOS App
+## Credits
 
-```bash
-xcrun --sdk iphoneos clang -target arm64-apple-ios15.0 \
-  -isysroot "$(xcrun --sdk iphoneos --show-sdk-path)" \
-  -framework UIKit -framework Foundation -framework CoreGraphics \
-  -fobjc-arc -O2 -o CVE27840App.app/CVE27840App ios_test_app.m
-
-ldid -S CVE27840App.app/CVE27840App
-
-mkdir Payload && cp -r CVE27840App.app Payload/
-zip -r CVE27840App.ipa Payload/
-```
-
-Install via TrollStore on iOS ≤17.4, or sideload via Xcode.
-
-## XNU Source References
-
-- Pre-patch: [`xnu-10063.101.15`](https://github.com/apple-oss-distributions/xnu/tree/xnu-10063.101.15)
-- Post-patch: [`xnu-10063.121.3`](https://github.com/apple-oss-distributions/xnu/tree/xnu-10063.121.3)
-- Key files: `osfmk/vm/vm_map.c`, `osfmk/vm/vm_fault.c`
-
-## Disclaimer
-
-For educational and defensive security research only. The userspace PoC operates on the calling process's own memory. It cannot access kernel memory, cause data loss, or trigger kernel panics.
+- Found by patch-diffing Apple's open-source XNU releases
+- On-device testing and binary verification by [@Somisomair](https://github.com/Somisomair)
+- Original vulnerability reported to Apple by an anonymous researcher
